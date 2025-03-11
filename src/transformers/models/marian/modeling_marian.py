@@ -39,11 +39,15 @@ from ...utils import (
     add_end_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
+    is_flash_attn_2_available,
+    is_flash_attn_greater_or_equal_2_10,
     logging,
     replace_return_docstrings,
 )
 from .configuration_marian import MarianConfig
 
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_varlen_func
 
 logger = logging.get_logger(__name__)
 
@@ -260,6 +264,85 @@ class MarianAttention(nn.Module):
 
         return attn_output, attn_weights_reshaped, past_key_value
 
+# Copied from transformers.models.bart.modeling_bart.BartAttention with Bart->Marian
+class MarianFlashAttention2(MarianAttention):
+    """
+    Marian flash attention module. This module inherits from `MarianAttention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+    flash attention and deal with padding tokens in case the input contains any of them.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states).view(bsz, tgt_len, self.num_heads, self.head_dim)
+        query_states *= self.scaling
+
+        if is_cross_attention and past_key_value is not None and past_key_value[0].shape[2] == key_value_states.shape[1]:
+            key_states = past_key_value[0]
+            value_states = past_key_value[1]
+        elif is_cross_attention:
+            key_states = self.k_proj(key_value_states).view(bsz, -1, self.num_heads, self.head_dim)
+            value_states = self.v_proj(key_value_states).view(bsz, -1, self.num_heads, self.head_dim)
+        elif past_key_value is not None:
+            key_states = self.k_proj(hidden_states).view(bsz, -1, self.num_heads, self.head_dim)
+            value_states = self.v_proj(hidden_states).view(bsz, -1, self.num_heads, self.head_dim)
+            key_states = torch.cat([past_key_value[0], key_states], dim=1)
+            value_states = torch.cat([past_key_value[1], value_states], dim=1)
+        else:
+            key_states = self.k_proj(hidden_states).view(bsz, -1, self.num_heads, self.head_dim)
+            value_states = self.v_proj(hidden_states).view(bsz, -1, self.num_heads, self.head_dim)
+
+        if self.is_decoder:
+            past_key_value = (key_states, value_states)
+
+        query_states = query_states.half()
+        key_states = key_states.half()
+        value_states = value_states.half()
+
+        query_states = query_states.transpose(0, 1).reshape(-1, self.num_heads, self.head_dim)
+        key_states = key_states.transpose(0, 1).reshape(-1, self.num_heads, self.head_dim)
+        value_states = value_states.transpose(0, 1).reshape(-1, self.num_heads, self.head_dim)
+
+        seq_len_q = tgt_len
+        seq_len_k = key_states.size(0) // bsz
+
+        cu_seqlens_q = torch.cat([torch.tensor([0], device=hidden_states.device), torch.full((bsz,), seq_len_q, device=hidden_states.device).cumsum(0)], dim=0).to(torch.int32)
+        cu_seqlens_k = torch.cat([torch.tensor([0], device=hidden_states.device), torch.full((bsz,), seq_len_k, device=hidden_states.device).cumsum(0)], dim=0).to(torch.int32)
+
+        attn_output = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=seq_len_q,
+            max_seqlen_k=seq_len_k,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+
+        attn_output = attn_output.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output.to(torch.float32))
+
+        return attn_output, None, past_key_value
 
 # Copied from transformers.models.bart.modeling_bart.BartEncoderLayer with Bart->Marian, BART->MARIAN
 class MarianEncoderLayer(nn.Module):
@@ -332,7 +415,10 @@ class MarianEncoderLayer(nn.Module):
         return outputs
 
 
-MARIAN_ATTENTION_CLASSES = {"eager": MarianAttention}
+MARIAN_ATTENTION_CLASSES = {
+    "eager": MarianAttention,
+    "flash_attention_2": MarianFlashAttention2,
+}
 
 
 # Copied from transformers.models.bart.modeling_bart.BartDecoderLayer with Bart->Marian, BART->MARIAN
@@ -460,6 +546,7 @@ class MarianPreTrainedModel(PreTrainedModel):
     config_class = MarianConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_flash_attn_2 = True
 
     def _init_weights(self, module: Union[nn.Linear, nn.Embedding, MarianSinusoidalPositionalEmbedding]):
         std = self.config.init_std
